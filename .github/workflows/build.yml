@@ -1,15 +1,95 @@
 name: Build ZMK firmware (nix)
+
 on:
   workflow_dispatch:
-  push:
+    inputs:
+      target:
+        description: Firmware target
+        type: choice
+        default: both
+        options:
+          - central
+          - both
+          - reset
+  pull_request:
     paths:
-      - config/**
-      - build.yaml
+      - 'config/**'
+      - 'build*.yaml'
+      - '.github/workflows/build.yml'
+  push:
+    branches:
+      - master
+    paths:
+      - 'config/**'
+      - 'build*.yaml'
+      - '.github/workflows/build.yml'
 
 jobs:
+  select-targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix_path: ${{ steps.select.outputs.matrix_path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select firmware build matrix
+        id: select
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_TARGET: ${{ inputs.target }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          target=both
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            target="$MANUAL_TARGET"
+          else
+            if [[ "$EVENT_NAME" == "pull_request" ]]; then
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+              if git cat-file -e "$base^{commit}" && git cat-file -e "$head^{commit}"; then
+                base="$(git merge-base "$base" "$head")"
+              else
+                base=""
+              fi
+            else
+              base="$PUSH_BEFORE_SHA"
+              head="$CURRENT_SHA"
+            fi
+
+            # Fall back to both halves unless the complete change set is keymaps.
+            if [[ -n "$base" ]] && [[ "$base" != "0000000000000000000000000000000000000000" ]] \
+                && git cat-file -e "$base^{commit}" && git cat-file -e "$head^{commit}"; then
+              changed_files="$(git diff --name-only "$base" "$head")"
+              if [[ -n "$changed_files" ]] \
+                  && ! grep -qEv '^config/.+\.keymap$' <<< "$changed_files"; then
+                target=central
+              fi
+            fi
+          fi
+
+          case "$target" in
+            central) matrix_path=build-keymap.yaml ;;
+            both)    matrix_path=build.yaml ;;
+            reset)   matrix_path=build-reset.yaml ;;
+            *) echo "Unknown target: $target" >&2; exit 1 ;;
+          esac
+
+          echo "Selected target: $target ($matrix_path)"
+          echo "matrix_path=$matrix_path" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: select-targets
     uses: urob/zmk-actions/.github/workflows/build-user-config.yml@main
     with:
-      # Set to 'gnuarmemb' 'zephyr' or 'zephyr-full' (from fastest to
-      # most compatible). ZMK Studio requires 'zephyr-full'.
+      build_matrix_path: ${{ needs.select-targets.outputs.matrix_path }}
       toolchain: zephyr
