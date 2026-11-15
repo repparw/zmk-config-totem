@@ -1,0 +1,5 @@
+# Keymap changes only need new firmware on the central (left) half.
+# Keep build.yaml as the full/recovery matrix.
+include:
+  - board: xiao_ble/nrf52840/zmk
+    shield: totem_left
