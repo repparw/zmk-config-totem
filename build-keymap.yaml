@@ -1,0 +1,4 @@
+# Keymap-only changes need firmware only on the central (left) half.
+include:
+  - board: xiao_ble/nrf52840/zmk
+    shield: totem_left

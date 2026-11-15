@@ -1,0 +1,8 @@
+# Complete firmware set for releases and firmware-affecting updates.
+include:
+  - board: xiao_ble/nrf52840/zmk
+    shield: totem_left
+  - board: xiao_ble/nrf52840/zmk
+    shield: totem_right
+  - board: xiao_ble/nrf52840/zmk
+    shield: settings_reset
