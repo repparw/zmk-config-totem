@@ -6,32 +6,39 @@ on:
       target:
         description: Firmware target
         type: choice
-        default: both
+        default: all
         options:
           - central
           - both
           - reset
+          - all
   pull_request:
     paths:
       - 'config/**'
       - 'build*.yaml'
       - '.github/workflows/build.yml'
+      - '.github/scripts/firmware-source-fingerprint.sh'
   push:
     branches:
       - master
-    paths:
-      - 'config/**'
-      - 'build*.yaml'
-      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zmk-firmware-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   select-targets:
     runs-on: ubuntu-24.04
     outputs:
+      target: ${{ steps.select.outputs.target }}
       matrix_path: ${{ steps.select.outputs.matrix_path }}
+      previous_tag: ${{ steps.select.outputs.previous_tag }}
+      source_fingerprint: ${{ steps.select.outputs.source_fingerprint }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -40,39 +47,76 @@ jobs:
         id: select
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           MANUAL_TARGET: ${{ inputs.target }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          CURRENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          target=both
+          target=all
+          previous_tag=
+          source_fingerprint=unknown
 
           if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             target="$MANUAL_TARGET"
-          else
-            if [[ "$EVENT_NAME" == "pull_request" ]]; then
-              base="$PR_BASE_SHA"
-              head="$PR_HEAD_SHA"
-              if git cat-file -e "$base^{commit}" && git cat-file -e "$head^{commit}"; then
-                base="$(git merge-base "$base" "$head")"
-              else
-                base=""
+          elif [[ "$EVENT_NAME" == "pull_request" ]]; then
+            # PR builds need no release assets. Unknown/mixed changes build all.
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+            if git cat-file -e "$base^{commit}" && git cat-file -e "$head^{commit}"; then
+              base="$(git merge-base "$base" "$head")"
+              mapfile -t changed < <(git diff --name-only "$base" "$head")
+              if (( ${#changed[@]} > 0 )); then
+                keymaps_only=true
+                for path in "${changed[@]}"; do
+                  [[ "$path" == config/*.keymap ]] || keymaps_only=false
+                done
+                if [[ "$keymaps_only" == true ]]; then target=central; fi
               fi
-            else
-              base="$PUSH_BEFORE_SHA"
-              head="$CURRENT_SHA"
             fi
+          else
+            # Source branches in west.yml and zmk-actions move independently
+            # of this repo; a changed source fingerprint forces a fresh build.
+            source_fingerprint="$(bash .github/scripts/firmware-source-fingerprint.sh 2>/dev/null || echo unknown)"
+            latest="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" 2>/dev/null || true)"
+            tag="$(jq -r '.tag_name // empty' <<< "$latest" 2>/dev/null || true)"
 
-            # Fall back to both halves unless the complete change set is keymaps.
-            if [[ -n "$base" ]] && [[ "$base" != "0000000000000000000000000000000000000000" ]] \
-                && git cat-file -e "$base^{commit}" && git cat-file -e "$head^{commit}"; then
-              changed_files="$(git diff --name-only "$base" "$head")"
-              if [[ -n "$changed_files" ]] \
-                  && ! grep -qEv '^config/.+\.keymap$' <<< "$changed_files"; then
-                target=central
+            left=totem_left-xiao_ble_nrf52840_zmk-zmk.uf2
+            right=totem_right-xiao_ble_nrf52840_zmk-zmk.uf2
+            reset=settings_reset-xiao_ble_nrf52840_zmk-zmk.uf2
+
+            if [[ "$tag" =~ ^firmware-([0-9a-f]{40})$ && "$source_fingerprint" != unknown ]]; then
+              previous_sha="${BASH_REMATCH[1]}"
+              previous_fingerprint="$(jq -r '.body // empty' <<< "$latest" |
+                grep -E '^Source fingerprint: [0-9a-f]{64}$' | head -n 1 | cut -d ' ' -f 3 || true)"
+
+              if [[ "$previous_fingerprint" == "$source_fingerprint" ]] \
+                  && jq -e --arg l "$left" --arg r "$right" --arg s "$reset" \
+                    '([.assets[] | select(.size > 0) | .name] | sort) == ([$l,$r,$s] | sort)' \
+                    <<< "$latest" >/dev/null \
+                  && git cat-file -e "$previous_sha^{commit}" \
+                  && git merge-base --is-ancestor "$previous_sha" "$GITHUB_SHA"; then
+                previous_tag="$tag"
+                mapfile -t changed < <(git diff --name-only "$previous_sha" "$GITHUB_SHA")
+                can_reuse=true
+                changed_keymap=false
+
+                for path in "${changed[@]}"; do
+                  case "$path" in
+                    config/*.keymap) changed_keymap=true ;;
+                    readme.md|layout/*|keymap_drawer.config.yaml|.gitignore) ;;
+                    *) can_reuse=false ;;
+                  esac
+                done
+
+                if [[ "$can_reuse" == true ]]; then
+                  if [[ "$changed_keymap" == true ]]; then
+                    target=central
+                  else
+                    target=none
+                  fi
+                fi
               fi
             fi
           fi
@@ -81,15 +125,145 @@ jobs:
             central) matrix_path=build-keymap.yaml ;;
             both)    matrix_path=build.yaml ;;
             reset)   matrix_path=build-reset.yaml ;;
-            *) echo "Unknown target: $target" >&2; exit 1 ;;
+            all)     matrix_path=build-all.yaml ;;
+            none)    matrix_path= ;;
+            *) echo "Unknown build target: $target" >&2; exit 1 ;;
           esac
 
-          echo "Selected target: $target ($matrix_path)"
-          echo "matrix_path=$matrix_path" >> "$GITHUB_OUTPUT"
+          echo "Selected target: $target; previous release: ${previous_tag:-none}"
+          {
+            echo "target=$target"
+            echo "matrix_path=$matrix_path"
+            echo "previous_tag=$previous_tag"
+            echo "source_fingerprint=$source_fingerprint"
+          } >> "$GITHUB_OUTPUT"
 
   build:
+    if: needs.select-targets.outputs.target != 'none'
     needs: select-targets
     uses: urob/zmk-actions/.github/workflows/build-user-config.yml@main
     with:
       build_matrix_path: ${{ needs.select-targets.outputs.matrix_path }}
       toolchain: zephyr
+
+  release:
+    if: >-
+      ${{ always() && github.event_name == 'push' &&
+          github.ref == 'refs/heads/master' &&
+          needs.select-targets.result == 'success' &&
+          (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    needs: [select-targets, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download newly built firmware
+        if: needs.select-targets.outputs.target != 'none'
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware
+          path: firmware
+
+      - name: Publish complete latest-master firmware release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ needs.select-targets.outputs.target }}
+          PREVIOUS_TAG: ${{ needs.select-targets.outputs.previous_tag }}
+          SOURCE_FINGERPRINT: ${{ needs.select-targets.outputs.source_fingerprint }}
+        run: |
+          set -euo pipefail
+          left=totem_left-xiao_ble_nrf52840_zmk-zmk.uf2
+          right=totem_right-xiao_ble_nrf52840_zmk-zmk.uf2
+          reset=settings_reset-xiao_ble_nrf52840_zmk-zmk.uf2
+          mkdir -p firmware
+
+          # Refuse to publish an old commit as "Latest" after master advances.
+          current_master="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/master" --jq '.object.sha')"
+          if [[ "$current_master" != "$GITHUB_SHA" ]]; then
+            echo "Newer master commit exists; skipping obsolete release."
+            exit 0
+          fi
+
+          # If upstream branches moved during the build, the reused binary
+          # could be incompatible. Never publish an unverified mixture.
+          current_fingerprint="$(bash .github/scripts/firmware-source-fingerprint.sh 2>/dev/null || echo unknown)"
+          if [[ "$current_fingerprint" != "$SOURCE_FINGERPRINT" ]]; then
+            echo "Upstream sources changed during the build; refusing release." >&2
+            exit 1
+          fi
+
+          case "$TARGET" in
+            all) ;;
+            central)
+              [[ -n "$PREVIOUS_TAG" ]] || exit 1
+              gh release download "$PREVIOUS_TAG" -R "$GITHUB_REPOSITORY" \
+                -p "$right" -p "$reset" -D firmware
+              ;;
+            none)
+              [[ -n "$PREVIOUS_TAG" ]] || exit 1
+              gh release download "$PREVIOUS_TAG" -R "$GITHUB_REPOSITORY" \
+                -p "$left" -p "$right" -p "$reset" -D firmware
+              ;;
+            *)
+              echo "Cannot create a full release from target: $TARGET" >&2
+              exit 1
+              ;;
+          esac
+
+          # Release assets are exactly the three UF2 images, no stale extras.
+          for file in "$left" "$right" "$reset"; do
+            [[ -s "firmware/$file" ]] || {
+              echo "Missing or empty: $file" >&2
+              exit 1
+            }
+          done
+          count="$(find firmware -maxdepth 1 -type f | wc -l)"
+          [[ "$count" -eq 3 ]] || { echo "Unexpected release assets" >&2; exit 1; }
+          sha256sum firmware/*.uf2
+
+          tag="firmware-$GITHUB_SHA"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists for $GITHUB_SHA."
+            exit 0
+          fi
+
+          {
+            echo "Firmware for master commit \`$GITHUB_SHA\`."
+            echo
+            echo "Source fingerprint: $SOURCE_FINGERPRINT"
+            echo
+            if [[ "$TARGET" == central ]]; then
+              echo "Left firmware rebuilt; right and settings reset reused from $PREVIOUS_TAG."
+            elif [[ "$TARGET" == none ]]; then
+              echo "All firmware reused from $PREVIOUS_TAG (no firmware-affecting changes)."
+            else
+              echo "All three firmware images rebuilt."
+            fi
+            echo
+            echo "Flash only the left half for keymap-only changes. To reset split pairing,"
+            echo "flash settings_reset to both halves, then flash both normal firmwares."
+          } > release-notes.md
+
+          gh release create "$tag" firmware/*.uf2 \
+            -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
+            --title "Latest master firmware (${GITHUB_SHA:0:8})" \
+            --notes-file release-notes.md
+
+          # Keep the current and previous automated releases for rollback
+          # and binary reuse. Never delete separately maintained releases.
+          mapfile -t older < <(
+            gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
+              --json tagName,publishedAt |
+              jq -r '[.[] | select(.tagName | test("^firmware-[0-9a-f]{40}$"))] |
+                sort_by(.publishedAt) | reverse | .[2:][] | .tagName'
+          )
+          for old_tag in "${older[@]}"; do
+            if ! gh release delete "$old_tag" -R "$GITHUB_REPOSITORY" -y --cleanup-tag; then
+              echo "::warning::Failed to delete older automated release $old_tag"
+            fi
+          done
